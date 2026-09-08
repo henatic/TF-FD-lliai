@@ -4,7 +4,7 @@ from __future__ import division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as vgg19
+from torchvision.models import vgg19
 
 
 def define_tsnet(name, num_class, cuda=True):
