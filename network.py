@@ -3,10 +3,16 @@ from __future__ import print_function
 from __future__ import division
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as vgg19
 
 
 def define_tsnet(name, num_class, cuda=True):
-	if name == 'resnet20':
+	if name == 'vgg19':
+		net = VGG19_KD(num_classes=num_class)
+		# Adjust the first convolutional layer or pooling for CIFAR's 32x32 input if necessary, 
+        # or rely on standard torchvision definitions depending on your base setup.
+	elif name == 'resnet20':
 		net = resnet20(num_class=num_class)
 	elif name == 'resnet110':
 		net = resnet110(num_class=num_class)
@@ -19,6 +25,101 @@ def define_tsnet(name, num_class, cuda=True):
 		net = torch.nn.DataParallel(net)
 
 	return net
+
+
+class VGG19_KD(nn.Module):
+    def __init__(self, num_classes=100):
+        super(VGG19_KD, self).__init__()
+        # Load the base VGG19 architecture without pretrained ImageNet weights
+        base_vgg = vgg19(pretrained=False)
+        self.features = base_vgg.features
+        
+        # Rebuild classifier for CIFAR 32x32 -> 1x1x512 spatial reduction
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(512, 512),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x):
+        # Manually chunk the sequential features into blocks matching ResNet's stages
+        # pool1=idx 4, pool2=idx 9, pool3=idx 18, pool4=idx 27, pool5=idx 36
+        stem = self.features[:5](x)
+        rb1 = self.features[5:19](stem)
+        rb2 = self.features[19:28](rb1)
+        rb3 = self.features[28:37](rb2)
+        
+        feat = rb3.view(rb3.size(0), -1)
+        out = self.classifier(feat)
+        
+        # Emulate the (pre_activation, post_activation) tuple expected by train_kd.py
+        return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
+
+    def get_channel_num(self):
+        # Match expected channel return signatures if using VID/AFD loss modes
+        return [64, 128, 256, 512, 512]
+
+
+class DynamicConv2d(nn.Conv2d):
+    def __init__(self, max_in_channels, max_out_channels, kernel_size, stride=1, padding=0, bias=True):
+        super(DynamicConv2d, self).__init__(
+            max_in_channels, max_out_channels, kernel_size, 
+            stride=stride, padding=padding, bias=bias
+        )
+        # The layer tracks the maximum possible size, but can use smaller slices.
+
+    def forward(self, x, active_out_channels):
+        # x.size(1) tells us how many channels the previous layer actually output
+        active_in_channels = x.size(1)
+        
+        # Slice the weight tensor: [active_out, active_in, kernel_h, kernel_w]
+        weight_slice = self.weight[:active_out_channels, :active_in_channels, :, :]
+        
+        # Slice the bias tensor if it exists
+        bias_slice = self.bias[:active_out_channels] if self.bias is not None else None
+
+        # Perform the convolution with the dynamically sliced weights
+        return F.conv2d(x, weight_slice, bias_slice, self.stride, self.padding, self.dilation, self.groups)
+
+
+class VGG_Supernet(nn.Module):
+    def __init__(self, num_classes=100):
+        super(VGG_Supernet, self).__init__()
+        
+        # Define maximum search space dimensions (standard VGG19 widths)
+        self.conv1 = DynamicConv2d(3, 64, kernel_size=3, padding=1)
+        self.conv2 = DynamicConv2d(64, 64, kernel_size=3, padding=1)
+        # ... additional layers ...
+        
+        # Classifier needs to dynamically adapt to the final convolution's output
+        self.classifier = nn.Linear(512, num_classes) # 512 is max possible
+
+    def forward(self, x, channel_config):
+        # channel_config is a list provided by the RL controller, e.g., [32, 48, ...]
+        
+        # Block 1
+        x = self.conv1(x, active_out_channels=channel_config[0])
+        x = F.relu(x)
+        x = self.conv2(x, active_out_channels=channel_config[1])
+        x = F.relu(x)
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # ... route through remaining blocks ...
+        
+        # Flatten and classify
+        x = x.view(x.size(0), -1)
+        
+        # Slice the final linear layer weights to match the active incoming features
+        active_in_features = x.size(1)
+        weight_slice = self.classifier.weight[:, :active_in_features]
+        bias_slice = self.classifier.bias
+        out = F.linear(x, weight_slice, bias_slice)
+        
+        return out
 
 
 class resblock(nn.Module):
