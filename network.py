@@ -9,7 +9,9 @@ from torchvision.models import vgg19
 
 def define_tsnet(name, num_class, cuda=True):
 	if name == 'vgg19':
-		net = VGG19_KD(num_classes=num_class)
+		# net = VGG19_KD(num_classes=num_class)
+		net = VGG_Supernet(num_classes=num_class)
+
 		# Adjust the first convolutional layer or pooling for CIFAR's 32x32 input if necessary, 
         # or rely on standard torchvision definitions depending on your base setup.
 	elif name == 'resnet20':
@@ -90,36 +92,97 @@ class VGG_Supernet(nn.Module):
     def __init__(self, num_classes=100):
         super(VGG_Supernet, self).__init__()
         
-        # Define maximum search space dimensions (standard VGG19 widths)
-        self.conv1 = DynamicConv2d(3, 64, kernel_size=3, padding=1)
-        self.conv2 = DynamicConv2d(64, 64, kernel_size=3, padding=1)
-        # ... additional layers ...
+        # Max VGG19 config: [64]*2, [128]*2, [256]*4, [512]*4, [512]*4
+        self.max_config = [64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512]
         
-        # Classifier needs to dynamically adapt to the final convolution's output
-        self.classifier = nn.Linear(512, num_classes) # 512 is max possible
+        # Block 1 (Stem Part 1)
+        self.conv1 = DynamicConv2d(3, 64, 3, padding=1)
+        self.conv2 = DynamicConv2d(64, 64, 3, padding=1)
+        
+        # Block 2 (Stem Part 2)
+        self.conv3 = DynamicConv2d(64, 128, 3, padding=1)
+        self.conv4 = DynamicConv2d(128, 128, 3, padding=1)
+        
+        # Block 3 (RB1)
+        self.conv5 = DynamicConv2d(128, 256, 3, padding=1)
+        self.conv6 = DynamicConv2d(256, 256, 3, padding=1)
+        self.conv7 = DynamicConv2d(256, 256, 3, padding=1)
+        self.conv8 = DynamicConv2d(256, 256, 3, padding=1)
+        
+        # Block 4 (RB2)
+        self.conv9 = DynamicConv2d(256, 512, 3, padding=1)
+        self.conv10 = DynamicConv2d(512, 512, 3, padding=1)
+        self.conv11 = DynamicConv2d(512, 512, 3, padding=1)
+        self.conv12 = DynamicConv2d(512, 512, 3, padding=1)
+        
+        # Block 5 (RB3)
+        self.conv13 = DynamicConv2d(512, 512, 3, padding=1)
+        self.conv14 = DynamicConv2d(512, 512, 3, padding=1)
+        self.conv15 = DynamicConv2d(512, 512, 3, padding=1)
+        self.conv16 = DynamicConv2d(512, 512, 3, padding=1)
+        
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # CIFAR 32x32 pooled 5 times becomes 1x1. Max features = 512
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(512, num_classes)
+        )
 
-    def forward(self, x, channel_config):
-        # channel_config is a list provided by the RL controller, e.g., [32, 48, ...]
-        
+    def forward(self, x, channel_config=None):
+        # Default to full VGG19 if no config is provided (used for base training)
+        if channel_config is None:
+            channel_config = self.max_config
+            
         # Block 1
-        x = self.conv1(x, active_out_channels=channel_config[0])
-        x = F.relu(x)
-        x = self.conv2(x, active_out_channels=channel_config[1])
-        x = F.relu(x)
-        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        x = F.relu(self.conv1(x, channel_config[0]))
+        x = F.relu(self.conv2(x, channel_config[1]))
+        x = self.pool(x)
         
-        # ... route through remaining blocks ...
+        # Block 2
+        x = F.relu(self.conv3(x, channel_config[2]))
+        x = F.relu(self.conv4(x, channel_config[3]))
+        stem = self.pool(x)
         
-        # Flatten and classify
-        x = x.view(x.size(0), -1)
+        # Block 3 (RB1)
+        x = F.relu(self.conv5(stem, channel_config[4]))
+        x = F.relu(self.conv6(x, channel_config[5]))
+        x = F.relu(self.conv7(x, channel_config[6]))
+        x = F.relu(self.conv8(x, channel_config[7]))
+        rb1 = self.pool(x)
         
-        # Slice the final linear layer weights to match the active incoming features
-        active_in_features = x.size(1)
-        weight_slice = self.classifier.weight[:, :active_in_features]
-        bias_slice = self.classifier.bias
-        out = F.linear(x, weight_slice, bias_slice)
+        # Block 4 (RB2)
+        x = F.relu(self.conv9(rb1, channel_config[8]))
+        x = F.relu(self.conv10(x, channel_config[9]))
+        x = F.relu(self.conv11(x, channel_config[10]))
+        x = F.relu(self.conv12(x, channel_config[11]))
+        rb2 = self.pool(x)
         
-        return out
+        # Block 5 (RB3)
+        x = F.relu(self.conv13(rb2, channel_config[12]))
+        x = F.relu(self.conv14(x, channel_config[13]))
+        x = F.relu(self.conv15(x, channel_config[14]))
+        x = F.relu(self.conv16(x, channel_config[15]))
+        rb3 = self.pool(x)
+        
+        feat = rb3.view(rb3.size(0), -1)
+        
+        # Dynamically slice the first linear layer to match active channels from conv16
+        active_features = feat.size(1)
+        weight_slice = self.classifier[0].weight[:, :active_features]
+        bias_slice = self.classifier[0].bias
+        out = F.linear(feat, weight_slice, bias_slice)
+        
+        # Pass through remainder of classifier
+        out = self.classifier[1:](out)
+
+        # Return tuples to satisfy train_kd.py structure
+        return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
+
+    def get_channel_num(self):
+        return [64, 128, 256, 512, 512]
 
 
 class resblock(nn.Module):

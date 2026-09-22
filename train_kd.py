@@ -391,11 +391,16 @@ def train(train_loader, nets, optimizer, criterions, epoch):
 		if args.kd_mode in ['logits', 'st']:
 			kd_loss = criterionKD(out_s, out_t.detach()) * args.lambda_kd
 		elif args.kd_mode in ['tfd']:
-			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
+			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:256, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:256, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:512, :, :].detach()))/3 * args.lambda_inter
 			kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 		elif args.kd_mode in ['tfd+']:
+			# kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1),reduction='batchmean') * 4 * 4 * args.lambda_kd
+			# kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1),reduction='batchmean') * 4 * 4 * args.lambda_kd
-			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:256, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:256, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:512, :, :].detach()))/3 * args.lambda_inter
 			kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 		elif args.kd_mode in ['fitnet', 'nst']:
 			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
@@ -497,11 +502,16 @@ def test(test_loader, nets, criterions, epoch):
 		if args.kd_mode in ['logits', 'st']:
 			kd_loss  = criterionKD(out_s, out_t.detach()) * args.lambda_kd
 		elif args.kd_mode in ['tfd']:
-			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
+			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:256, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:256, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:512, :, :].detach()))/3 * args.lambda_inter
 			kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 		elif args.kd_mode in ['tfd+']:
+			# kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1),reduction='batchmean') * 4 * 4 * args.lambda_kd
+			# kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			# kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1),reduction='batchmean') * 4 * 4 * args.lambda_kd
-			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:16, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:16, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:32, :, :].detach()))/3 * args.lambda_inter
+			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1],2), rb2_s[1][:, 0:256, :, :].detach())+ F.mse_loss(F.avg_pool2d(rb1_s[1],4), rb3_s[1][:, 0:256, :, :].detach())+F.mse_loss(F.avg_pool2d(rb2_s[1],2), rb3_s[1][:, 0:512, :, :].detach()))/3 * args.lambda_inter
 			kd_loss += (intra_fd(rb1_s[1])+intra_fd(rb2_s[1])+intra_fd(rb3_s[1]) )/3  * args.lambda_intra
 		elif args.kd_mode in ['fitnet', 'nst']:
 			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
