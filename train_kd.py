@@ -248,6 +248,9 @@ def main():
 
 	best_top1 = 0
 	best_top5 = 0
+
+	overall_start_time = time.time()  # Start overall timer
+
 	for epoch in range(1, args.epochs+1):
 		adjust_lr(optimizer, epoch)
 
@@ -277,6 +280,12 @@ def main():
 			'prec@5': test_top5,
 		}, is_best, args.save_root)
 		print('S_best_acc:', best_top1)
+
+	# Calculate and log total time
+	overall_duration = time.time() - overall_start_time
+	hours, rem = divmod(overall_duration, 3600)
+	minutes, seconds = divmod(rem, 60)
+	logging.info('Overall training time: {:0>2}h {:0>2}m {:05.2f}s'.format(int(hours), int(minutes), seconds))
 
 def train_init(train_loader, nets, optimizer, criterions, total_epoch):
 	snet = nets['snet']

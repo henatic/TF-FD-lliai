@@ -101,7 +101,7 @@ def main():
     vgg_baseline_flops, _ = calculate_vgg_cost(max_config, num_classes=100)
     
     # Set the target to 10% of the full VGG19 compute cost
-    target_flops = vgg_baseline_flops * 0.10 
+    target_flops = vgg_baseline_flops * 0.10
     
     print(f"VGG19 Baseline FLOPs: {vgg_baseline_flops / 1e6:.1f}M")
     print(f"Search Target FLOPs: {target_flops / 1e6:.1f}M")
