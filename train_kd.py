@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
 import os
+import shutil
 import sys
 import time
 import logging
@@ -279,6 +280,17 @@ def main():
 			'prec@1': test_top1,
 			'prec@5': test_top5,
 		}, is_best, args.save_root)
+		student_checkpoint = {
+			'epoch': epoch,
+			'net': snet.state_dict(),
+			'prec@1': test_top1,
+			'prec@5': test_top5,
+		}
+		student_save_path = os.path.join(args.save_root, 'student_checkpoint.pth.tar')
+		torch.save(student_checkpoint, student_save_path)
+		if is_best:
+			student_best_path = os.path.join(args.save_root, 'student_model_best.pth.tar')
+			shutil.copyfile(student_save_path, student_best_path)
 		print('S_best_acc:', best_top1)
 
 	# Calculate and log total time
