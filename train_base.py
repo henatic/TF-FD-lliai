@@ -43,6 +43,8 @@ parser.add_argument('--note', type=str, default='try', help='note for this run')
 # net and dataset choosen
 parser.add_argument('--data_name', type=str, required=True, help='name of dataset') # cifar10/cifar100
 parser.add_argument('--net_name', type=str, required=True, help='name of basenet')  # resnet20/resnet110
+parser.add_argument('--hub_repo', type=str, default=None, help='Torch hub repo (e.g., pytorch/vision:v0.10.0) or local path')
+parser.add_argument('--hub_source', type=str, default='github', choices=['github', 'local'], help='Source for torch hub')
 
 
 args, unparsed = parser.parse_known_args()
@@ -68,7 +70,7 @@ def main():
 	logging.info("unparsed_args = %s", unparsed)
 
 	logging.info('----------- Network Initialization --------------')
-	net = define_tsnet(name=args.net_name, num_class=args.num_class, cuda=args.cuda)
+	net = define_tsnet(name=args.net_name, num_class=args.num_class, cuda=args.cudahub_repo=args.hub_repo, hub_source=args.hub_source)
 	logging.info('%s', net)
 	logging.info("param size = %fMB", count_parameters_in_MB(net))
 	logging.info('-----------------------------------------------')

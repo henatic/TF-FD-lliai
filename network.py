@@ -4,32 +4,69 @@ from __future__ import division
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.hub as hub
 from torchvision.models import vgg19
+from torchvision.models.feature_extraction import create_feature_extractor
 
+def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github', return_nodes=None):
+    if hub_repo is not None:
+        print(f"Loading {name} from {hub_source} hub: {hub_repo}")
+        net = torch.hub.load(hub_repo, name, source=hub_source, pretrained=True)
+        
+        # Dynamically adapt the final classification layer for CIFAR-100
+        if hasattr(net, 'fc'):
+            in_features = net.fc.in_features
+            net.fc = nn.Linear(in_features, num_class)
+        elif hasattr(net, 'classifier') and isinstance(net.classifier, nn.Sequential):
+            if isinstance(net.classifier[-1], nn.Linear):
+                in_features = net.classifier[-1].in_features
+                net.classifier[-1] = nn.Linear(in_features, num_class)
+                
+        # If a node mapping is provided, wrap the model for distillation compatibility
+        if return_nodes:
+            net = HubModelWrapper(net, return_nodes)
+    else:
+        if name == 'vgg19':
+            net = VGG_Supernet(num_classes=num_class)
+        elif name == 'vgg19_slim':
+            net = VGG_Slim(num_classes=num_class)
+        elif name in ['vgg19_pretrained', 'vgg19_teacher']:
+            net = PretrainedVGG19(num_classes=num_class)
+        elif name == 'resnet20':
+            net = resnet20(num_class=num_class)
+        elif name == 'resnet110':
+            net = resnet110(num_class=num_class)
+        else:
+            raise Exception('Model name does not exist.')
 
-def define_tsnet(name, num_class, cuda=True):
-	if name == 'vgg19':
-		# net = VGG19_KD(num_classes=num_class)
-		net = VGG_Supernet(num_classes=num_class)
+    if cuda:
+        net = torch.nn.DataParallel(net).cuda()
+    else:
+        net = torch.nn.DataParallel(net)
 
-		# Adjust the first convolutional layer or pooling for CIFAR's 32x32 input if necessary, 
-        # or rely on standard torchvision definitions depending on your base setup.
-	elif name == 'vgg19_slim':
-		net = VGG_Slim(num_classes=num_class)
-	elif name == 'resnet20':
-		net = resnet20(num_class=num_class)
-	elif name == 'resnet110':
-		net = resnet110(num_class=num_class)
-	else:
-		raise Exception('model name does not exist.')
+    return net
 
-	if cuda:
-		net = torch.nn.DataParallel(net).cuda()
-	else:
-		net = torch.nn.DataParallel(net)
-
-	return net
-
+class HubModelWrapper(nn.Module):
+    def __init__(self, base_model, return_nodes):
+        super(HubModelWrapper, self).__init__()
+        # return_nodes maps internal model nodes to our required output names
+        # e.g., {'layer1': 'rb1', 'layer2': 'rb2', 'layer3': 'rb3', 'flatten': 'feat', 'fc': 'out'}
+        self.feature_extractor = create_feature_extractor(base_model, return_nodes=return_nodes)
+        
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        
+        # Extract features, defaulting to the input tensor if a node was mapped incorrectly
+        stem = features.get('stem', x)
+        rb1  = features.get('rb1', x)
+        rb2  = features.get('rb2', x)
+        rb3  = features.get('rb3', x)
+        feat = features.get('feat', x)
+        out  = features.get('out', x)
+        
+        # train_kd.py expects the first four outputs to be tuples of (pre_act, post_act)
+        # Hub models only output post-activations, so we duplicate the tensor to satisfy the unpacker
+        return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
 
 class VGG19_KD(nn.Module):
     def __init__(self, num_classes=100):
@@ -50,22 +87,37 @@ class VGG19_KD(nn.Module):
         )
 
     def forward(self, x):
-        # Manually chunk the sequential features into blocks matching ResNet's stages
-        # pool1=idx 4, pool2=idx 9, pool3=idx 18, pool4=idx 27, pool5=idx 36
-        stem = self.features[:5](x)
-        rb1 = self.features[5:19](stem)
+		# Manually chunk the sequential features into blocks matching ResNet's stages
+		# pool1=idx 4, pool2=idx 9, pool3=idx 18, pool4=idx 27, pool5=idx 36
+        stem = self.features[:10](x)
+        rb1 = self.features[10:19](stem)
         rb2 = self.features[19:28](rb1)
         rb3 = self.features[28:37](rb2)
-        
+
         feat = rb3.view(rb3.size(0), -1)
         out = self.classifier(feat)
-        
-        # Emulate the (pre_activation, post_activation) tuple expected by train_kd.py
+
+		# Emulate the (pre_activation, post_activation) tuple expected by train_kd.py
         return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
 
     def get_channel_num(self):
-        # Match expected channel return signatures if using VID/AFD loss modes
+		# Match expected channel return signatures if using VID/AFD loss modes
         return [64, 128, 256, 512, 512]
+
+
+class PretrainedVGG19(VGG19_KD):
+	"""VGG19 with ImageNet convolution weights and a CIFAR classifier head."""
+
+	def __init__(self, num_classes=100):
+		super(PretrainedVGG19, self).__init__(num_classes=num_classes)
+		self._load_imagenet_features()
+
+	def _load_imagenet_features(self):
+		try:
+			base_vgg = vgg19(weights='DEFAULT')
+		except (TypeError, ValueError):
+			base_vgg = vgg19(pretrained=True)
+		self.features.load_state_dict(base_vgg.features.state_dict())
 
 
 class DynamicConv2d(nn.Conv2d):
@@ -93,9 +145,10 @@ class DynamicConv2d(nn.Conv2d):
 class VGG_Supernet(nn.Module):
     def __init__(self, num_classes=100):
         super(VGG_Supernet, self).__init__()
-        
-        # Max VGG19 config: [64]*2, [128]*2, [256]*4, [512]*4, [512]*4
-        self.max_config = [64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512]
+
+		# VGG19 convolution widths: 64x2, 128x2, 256x4, 512x8.
+        self.max_config = [64, 64, 128, 128, 256, 256, 256, 256,
+                           512, 512, 512, 512, 512, 512, 512, 512]
         
         # Block 1 (Stem Part 1)
         self.conv1 = DynamicConv2d(3, 64, 3, padding=1)
@@ -185,6 +238,28 @@ class VGG_Supernet(nn.Module):
 
     def get_channel_num(self):
         return [64, 128, 256, 512, 512]
+
+
+def initialize_vgg19_supernet(supernet):
+	"""Copy ImageNet VGG19 convolution weights into a NAS supernet."""
+	try:
+		base_vgg = vgg19(weights='DEFAULT')
+	except (TypeError, ValueError):
+		base_vgg = vgg19(pretrained=True)
+
+	target = supernet.module if isinstance(supernet, nn.DataParallel) else supernet
+	target_layers = [target.conv1, target.conv2, target.conv3, target.conv4,
+					 target.conv5, target.conv6, target.conv7, target.conv8,
+					 target.conv9, target.conv10, target.conv11, target.conv12,
+					 target.conv13, target.conv14, target.conv15, target.conv16]
+	source_layers = [layer for layer in base_vgg.features if isinstance(layer, nn.Conv2d)]
+
+	with torch.no_grad():
+		for target_layer, source_layer in zip(target_layers, source_layers):
+			target_layer.weight.copy_(source_layer.weight)
+			target_layer.bias.copy_(source_layer.bias)
+
+	return supernet
 
 
 class VGG_Slim(VGG_Supernet):

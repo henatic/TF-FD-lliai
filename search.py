@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import torch
 import torch.nn as nn
@@ -8,9 +9,12 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, random_split
 
 # Import your custom modules
-from network import define_tsnet
+from network import define_tsnet, initialize_vgg19_supernet
 from controller import NASController
 from reward import calculate_vgg_cost, compute_reward
+
+VGG19_MAX_CONFIG = [64, 64, 128, 128, 256, 256, 256, 256,
+                    512, 512, 512, 512, 512, 512, 512, 512]
 
 def get_nas_dataloaders(img_root='./datasets', batch_size=128):
     mean = (0.5071, 0.4865, 0.4409)
@@ -44,7 +48,8 @@ def train_supernet(supernet, loader, optimizer, criterion, channel_choices, devi
         img, target = img.to(device), target.to(device)
         
         # Fair sampling: pick a random architecture for this batch to train all weights evenly
-        random_config = [random.choice(channel_choices) for _ in range(16)]
+        random_config = [min(random.choice(channel_choices), VGG19_MAX_CONFIG[layer])
+                 for layer in range(16)]
         
         optimizer.zero_grad()
         # VGG_Supernet returns (stem, rb1, rb2, rb3, feat, out)
@@ -70,7 +75,8 @@ def train_controller(controller, supernet, loader, optimizer, criterion, channel
         
         # 1. Controller samples an architecture
         action_indices, log_prob = controller()
-        channel_config = [channel_choices[idx] for idx in action_indices]
+        channel_config = [min(channel_choices[idx], VGG19_MAX_CONFIG[layer])
+                  for layer, idx in enumerate(action_indices)]
         
         # 2. Evaluate hardware cost
         sampled_flops, _ = calculate_vgg_cost(channel_config, num_classes=100)
@@ -97,7 +103,7 @@ def main():
     channel_choices = [32, 64, 128, 256, 512]
     
     # Calculate baseline FLOPs dynamically
-    max_config = [64, 64, 128, 128, 256, 256, 256, 256, 512, 512, 512, 512, 512, 512, 512, 512]
+    max_config = VGG19_MAX_CONFIG
     vgg_baseline_flops, _ = calculate_vgg_cost(max_config, num_classes=100)
     
     # Set the target to 10% of the full VGG19 compute cost
@@ -110,6 +116,7 @@ def main():
     supernet_loader, controller_loader = get_nas_dataloaders()
     
     supernet = define_tsnet('vgg19', num_class=100, cuda=torch.cuda.is_available())
+    initialize_vgg19_supernet(supernet)
     supernet_optimizer = optim.SGD(supernet.parameters(), lr=0.025, momentum=0.9, weight_decay=3e-4)
     
     controller = NASController(num_layers=16, num_choices=len(channel_choices)).to(device)
@@ -142,6 +149,9 @@ def main():
             # Wrap the config list in quotes so it occupies a single CSV column
             config_str = f'"{str(last_config)}"'
             f.write(f"{epoch+1},{sup_loss:.4f},{avg_reward:.4f},{config_str}\n")
+
+        with open("nas_vgg19_config.json", "w") as f:
+            json.dump(last_config, f)
 
 if __name__ == '__main__':
     main()

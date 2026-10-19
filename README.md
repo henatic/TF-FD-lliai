@@ -68,6 +68,22 @@ class TfFD(nn.Module):
 ## Training
 Run train_kd.py for training Tf-FD in CIFAR datasets. 
 
+### Pretrained VGG19 and NAS
+
+The NAS search can initialize its VGG19 supernet from torchvision's ImageNet weights and writes the latest channel configuration to `nas_vgg19_config.json`:
+
+```bash
+python search.py
+```
+
+Run TF-FD using that configuration without training a separate base model:
+
+```bash
+python train_kd.py --use_pretrained_vgg --s_name vgg19_slim --student_config nas_vgg19_config.json --kd_mode tfd --note pretrained-vgg19-tfd
+```
+
+The distilled student is saved as `student_model_best.pth.tar` under the experiment directory. The `tfd` mode follows the existing teacher-free feature-distillation implementation; use `--kd_mode tfd+` when the teacher logits should also contribute to the loss.
+
 Tf-FD:
 
 ```python
