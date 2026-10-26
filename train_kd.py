@@ -105,25 +105,6 @@ def main():
 
 	# Dynamically assign node mappings based on the requested model architecture
 	distillation_nodes = None
-	if args.hub_repo is not None:
-		if 'resnet' in args.s_name:
-			distillation_nodes = {
-				'maxpool': 'stem',
-				'layer1': 'rb1',
-				'layer2': 'rb2',
-				'layer3': 'rb3',
-				'flatten': 'feat',
-				'fc': 'out'
-			}
-		elif 'vgg' in args.s_name:
-			distillation_nodes = {
-				'features.9': 'stem',    # End of Block 2 (128 channels)
-				'features.18': 'rb1',    # End of Block 3 (256 channels)
-				'features.27': 'rb2',    # End of Block 4 (512 channels)
-				'features.36': 'rb3',    # End of Block 5 (512 channels)
-				'flatten': 'feat',
-				'classifier.6': 'out'    # Final Linear layer
-			}
 
 	logging.info('----------- Network Initialization --------------')
 	snet = define_tsnet(
@@ -443,25 +424,17 @@ def train(train_loader, nets, optimizer, criterions, epoch):
 		if args.kd_mode in ['logits', 'st']:
 			kd_loss = criterionKD(out_s, out_t.detach()) * args.lambda_kd
 		elif args.kd_mode in ['tfd']:
-			c12 = min(rb1_s[1].shape[1], rb2_s[1].shape[1])
-			c13 = min(rb1_s[1].shape[1], rb3_s[1].shape[1])
-			c23 = min(rb2_s[1].shape[1], rb3_s[1].shape[1])
-			
-			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c12], 2), rb2_s[1][:, :c12].detach()) + 
-					   F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c13], 4), rb3_s[1][:, :c13].detach()) + 
-					   F.mse_loss(F.avg_pool2d(rb2_s[1][:, :c23], 2), rb3_s[1][:, :c23].detach())) / 3 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3 * args.lambda_intra
+			kd_loss = (inter_fd(rb1_s[1], rb2_s[1]) + 
+					   inter_fd(rb1_s[1], rb3_s[1]) + 
+					   inter_fd(rb2_s[1], rb3_s[1])) / 3.0 * args.lambda_inter
+			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3.0 * args.lambda_intra
 			
 		elif args.kd_mode in ['tfd+']:
-			c12 = min(rb1_s[1].shape[1], rb2_s[1].shape[1])
-			c13 = min(rb1_s[1].shape[1], rb3_s[1].shape[1])
-			c23 = min(rb2_s[1].shape[1], rb3_s[1].shape[1])
-			
 			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1), reduction='batchmean') * 4 * 4 * args.lambda_kd
-			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c12], 2), rb2_s[1][:, :c12].detach()) + 
-					    F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c13], 4), rb3_s[1][:, :c13].detach()) + 
-					    F.mse_loss(F.avg_pool2d(rb2_s[1][:, :c23], 2), rb3_s[1][:, :c23].detach())) / 3 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3 * args.lambda_intra
+			kd_loss += (inter_fd(rb1_s[1], rb2_s[1]) + 
+					    inter_fd(rb1_s[1], rb3_s[1]) + 
+					    inter_fd(rb2_s[1], rb3_s[1])) / 3.0 * args.lambda_inter
+			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3.0 * args.lambda_intra
 		elif args.kd_mode in ['fitnet', 'nst']:
 			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
 		elif args.kd_mode in ['at', 'sp']:
@@ -635,6 +608,30 @@ def intra_fd(f_s):
     f_s = torch.index_select(f_s, 1, indices_s)
     loss = F.mse_loss(f_s[:, 0:f_s.shape[1]//2, :, :], f_s[:, f_s.shape[1]//2: f_s.shape[1], :, :])
     return loss
+
+def inter_fd(f_s, f_t):
+    """
+    Dynamically aligns both channel depth and spatial resolution 
+    between any two arbitrary feature maps before calculating MSE.
+    """
+    # 1. Align Channels (C)
+    min_C = min(f_s.shape[1], f_t.shape[1])
+    f_s_sliced = f_s[:, :min_C, :, :]
+    f_t_sliced = f_t[:, :min_C, :, :]
+    
+    # 2. Align Spatial Dimensions (H, W)
+    s_H, t_H = f_s_sliced.shape[2], f_t_sliced.shape[2]
+    if s_H > t_H:
+        f_s_aligned = F.adaptive_avg_pool2d(f_s_sliced, (t_H, t_H))
+        f_t_aligned = f_t_sliced
+    elif s_H < t_H:
+        f_s_aligned = f_s_sliced
+        f_t_aligned = F.adaptive_avg_pool2d(f_t_sliced, (s_H, s_H))
+    else:
+        f_s_aligned = f_s_sliced
+        f_t_aligned = f_t_sliced
+        
+    return F.mse_loss(f_s_aligned, f_t_aligned.detach())
 
 def adjust_lr_init(optimizer, epoch):
 	scale   = 0.1

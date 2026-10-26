@@ -6,14 +6,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.hub as hub
 from torchvision.models import vgg19
-from torchvision.models.feature_extraction import create_feature_extractor
+from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
 
 def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github', return_nodes=None):
     if hub_repo is not None:
         print(f"Loading {name} from {hub_source} hub: {hub_repo}")
         net = torch.hub.load(hub_repo, name, source=hub_source, pretrained=True)
         
-        # Dynamically adapt the final classification layer for CIFAR-100
+        # Dynamically adapt the final classification layer for CIFAR-100 (or other num_class)
         if hasattr(net, 'fc'):
             in_features = net.fc.in_features
             net.fc = nn.Linear(in_features, num_class)
@@ -22,10 +22,16 @@ def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github',
                 in_features = net.classifier[-1].in_features
                 net.classifier[-1] = nn.Linear(in_features, num_class)
                 
-        # If a node mapping is provided, wrap the model for distillation compatibility
-        if return_nodes:
-            net = HubModelWrapper(net, return_nodes)
+        # AUTO-DISCOVERY: If no manual mapping is provided, figure it out dynamically
+        if return_nodes is None:
+            print("Auto-discovering distillation nodes...")
+            return_nodes = auto_discover_nodes(net)
+            print(f"Discovered mapping: {return_nodes}")
+            
+        # Wrap the model for distillation compatibility (6-tuple output)
+        net = HubModelWrapper(net, return_nodes)
     else:
+        # Fallback to local offline custom architectures
         if name == 'vgg19':
             net = VGG_Supernet(num_classes=num_class)
         elif name == 'vgg19_slim':
@@ -39,12 +45,79 @@ def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github',
         else:
             raise Exception('Model name does not exist.')
 
+    # Apply hardware parallelization
     if cuda:
         net = torch.nn.DataParallel(net).cuda()
     else:
         net = torch.nn.DataParallel(net)
 
     return net
+
+def auto_discover_nodes(model, input_shape=(2, 3, 32, 32)):
+    """
+    Passes a dummy tensor through the model to track feature map shapes
+    and automatically maps the stage boundaries for distillation.
+    """
+    # Force eval mode to prevent BatchNorm variance crashes on small dummy batches
+    model.eval()
+    
+    train_nodes, _ = get_graph_node_names(model)
+    
+    # Create an extractor that returns the output of every single node
+    extractor = create_feature_extractor(model, return_nodes={n: n for n in train_nodes})
+    
+    # Ensure the extractor is on CPU for the dummy pass to avoid CUDA memory bloat
+    extractor = extractor.cpu()
+    dummy_input = torch.randn(input_shape)
+    
+    with torch.no_grad():
+        features = extractor(dummy_input)
+        
+    stage_boundaries = []
+    current_h = input_shape[2]
+    last_4d_node = None
+    feat_node = None
+    
+    # Iterate through the execution graph in order
+    for node_name, feat in features.items():
+        if isinstance(feat, torch.Tensor):
+            # Track spatial resolution drops (Pooling / Strided Convs)
+            if feat.dim() == 4:
+                h = feat.shape[2]
+                if h < current_h:
+                    # The resolution dropped, so the PREVIOUS node was the end of the stage
+                    if last_4d_node is not None:
+                        stage_boundaries.append(last_4d_node)
+                    current_h = h
+                last_4d_node = node_name
+                
+            # Track the flattened feature vector
+            elif feat.dim() == 2:
+                # Continuously update until the end to capture the final layer before 'out'
+                if node_name != train_nodes[-1]: 
+                    feat_node = node_name
+
+    # Fallback: if the network has fewer than 4 pooling stages, duplicate the deepest node
+    while len(stage_boundaries) < 4:
+        stage_boundaries.append(last_4d_node)
+
+    # Fallback: if no 2D flattening node is found, use the final 4D node
+    if feat_node is None:
+        feat_node = last_4d_node
+
+    distillation_nodes = {
+        stage_boundaries[0]: 'stem',
+        stage_boundaries[1]: 'rb1',
+        stage_boundaries[2]: 'rb2',
+        stage_boundaries[3]: 'rb3',
+        feat_node: 'feat',
+        train_nodes[-1]: 'out'
+    }
+    
+    # Return the model to train mode before exiting
+    model.train()
+    
+    return distillation_nodes
 
 class HubModelWrapper(nn.Module):
     def __init__(self, base_model, return_nodes):
