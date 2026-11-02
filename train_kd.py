@@ -9,6 +9,7 @@ import logging
 import argparse
 import json
 import numpy as np
+import random
 from itertools import chain
 
 import torch
@@ -21,6 +22,7 @@ from utils import *
 from utils import AverageMeter, accuracy, transform_time
 from utils import load_pretrained_model, save_checkpoint
 from utils import create_exp_dir, count_parameters_in_MB
+from nas_supernet import EdgeSupernet, NASChoiceBlock
 from network import define_tsnet
 from network import initialize_vgg19_supernet
 # from models import define_tsnet
@@ -339,8 +341,8 @@ def train_init(train_loader, nets, optimizer, criterions, total_epoch):
 				img = img.cuda(non_blocking=True)
 				target = target.cuda(non_blocking=True)
 
-			stem_s, rb1_s, rb2_s, rb3_s, feat_s, out_s = snet(img)
-			stem_t, rb1_t, rb2_t, rb3_t, feat_t, out_t = tnet(img)
+			stages_s, feat_s, out_s = snet(img)
+			stages_t, feat_t, out_t = tnet(img)
 
 			cls_loss = criterionCls(out_s, target) * 0.0
 			if args.kd_mode in ['fsp']:
@@ -407,34 +409,75 @@ def train(train_loader, nets, optimizer, criterions, epoch):
 			criterionKD[i].train()
 
 	end = time.time()
-	for i, (img, target) in enumerate(train_loader, start=1):
-		data_time.update(time.time() - end)
+	for batch_idx, (img, target) in enumerate(train_loader):
+		img, target = img.cuda(), target.cuda()
+		
+		# --- NAS CONTROLLER: Sample a random sub-network for this batch ---
+		if isinstance(snet, EdgeSupernet) or hasattr(snet, 'module') and isinstance(snet.module, EdgeSupernet):
+			base_net = snet.module if hasattr(snet, 'module') else snet
+			for name, module in base_net.named_modules():
+				if isinstance(module, NASChoiceBlock):
+					# Randomly pick an architecture choice (0 to len(choices)-1)
+					module.active_choice = random.randint(0, len(module.choices) - 1)
+		# ------------------------------------------------------------------
 
-		if args.cuda:
-			img = img.cuda(non_blocking=True)
-			target = target.cuda(non_blocking=True)
-
-		if args.kd_mode in ['sobolev', 'lwm']:
-			img.requires_grad = True
-
-		stem_s, rb1_s, rb2_s, rb3_s, feat_s, out_s = snet(img)
-		stem_t, rb1_t, rb2_t, rb3_t, feat_t, out_t = tnet(img)
+		optimizer.zero_grad()
+		
+		# The Supernet natively returns the dynamic list your tfd loss expects
+		stages_s, feat_s, out_s = snet(img)
+		stages_t, feat_t, out_t = tnet(img)
 
 		cls_loss = criterionCls(out_s, target)
 		if args.kd_mode in ['logits', 'st']:
 			kd_loss = criterionKD(out_s, out_t.detach()) * args.lambda_kd
 		elif args.kd_mode in ['tfd']:
-			kd_loss = (inter_fd(rb1_s[1], rb2_s[1]) + 
-					   inter_fd(rb1_s[1], rb3_s[1]) + 
-					   inter_fd(rb2_s[1], rb3_s[1])) / 3.0 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3.0 * args.lambda_intra
+			inter_loss = 0.0
+			intra_loss = 0.0
+			num_pairs = 0
+			
+			# Skip stage 0 (the stem) to mimic original rb1, rb2, rb3 logic
+			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
+			
+			# 1. Intra-layer loss (Self-regularization for every stage)
+			for stage in distill_stages:
+				intra_loss += intra_fd(stage)
+			intra_loss = intra_loss / len(distill_stages)
+			
+			# 2. Inter-layer loss (Compare every shallow stage to every deeper stage)
+			for i in range(len(distill_stages)):
+				for j in range(i + 1, len(distill_stages)):
+					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
+					num_pairs += 1
+					
+			if num_pairs > 0:
+				inter_loss = inter_loss / num_pairs
+
+			kd_loss = (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
 			
 		elif args.kd_mode in ['tfd+']:
+			inter_loss = 0.0
+			intra_loss = 0.0
+			num_pairs = 0
+			
+			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
+			
+			for stage in distill_stages:
+				intra_loss += intra_fd(stage)
+			intra_loss = intra_loss / len(distill_stages)
+			
+			for i in range(len(distill_stages)):
+				for j in range(i + 1, len(distill_stages)):
+					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
+					num_pairs += 1
+					
+			if num_pairs > 0:
+				inter_loss = inter_loss / num_pairs
+				
+			# Base KL Divergence Loss
 			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1), reduction='batchmean') * 4 * 4 * args.lambda_kd
-			kd_loss += (inter_fd(rb1_s[1], rb2_s[1]) + 
-					    inter_fd(rb1_s[1], rb3_s[1]) + 
-					    inter_fd(rb2_s[1], rb3_s[1])) / 3.0 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3.0 * args.lambda_intra
+			
+			# Add dynamic inter and intra losses
+			kd_loss += (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
 		elif args.kd_mode in ['fitnet', 'nst']:
 			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
 		elif args.kd_mode in ['at', 'sp']:
@@ -512,6 +555,7 @@ def test(test_loader, nets, criterions, epoch):
 	criterionKD  = criterions['criterionKD']
 
 	snet.eval()
+	tnet.eval()
 	if args.kd_mode in ['vid', 'ofd']:
 		for i in range(1,4):
 			criterionKD[i].eval()
@@ -524,36 +568,64 @@ def test(test_loader, nets, criterions, epoch):
 
 		if args.kd_mode in ['sobolev', 'lwm']:
 			img.requires_grad = True
-			stem_s, rb1_s, rb2_s, rb3_s, feat_s, out_s = snet(img)
-			stem_t, rb1_t, rb2_t, rb3_t, feat_t, out_t = tnet(img)
+			stages_s, feat_s, out_s = snet(img)
+			stages_t, feat_t, out_t = tnet(img)
 		else:
 			with torch.no_grad():
-				stem_s, rb1_s, rb2_s, rb3_s, feat_s, out_s = snet(img)
-				stem_t, rb1_t, rb2_t, rb3_t, feat_t, out_t = tnet(img)
+				stages_s, feat_s, out_s = snet(img)
+				stages_t, feat_t, out_t = tnet(img)
 
 		cls_loss = criterionCls(out_s, target)
 		if args.kd_mode in ['logits', 'st']:
 			kd_loss  = criterionKD(out_s, out_t.detach()) * args.lambda_kd
 		elif args.kd_mode in ['tfd']:
-			c12 = min(rb1_s[1].shape[1], rb2_s[1].shape[1])
-			c13 = min(rb1_s[1].shape[1], rb3_s[1].shape[1])
-			c23 = min(rb2_s[1].shape[1], rb3_s[1].shape[1])
+			inter_loss = 0.0
+			intra_loss = 0.0
+			num_pairs = 0
 			
-			kd_loss = (F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c12], 2), rb2_s[1][:, :c12].detach()) + 
-					   F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c13], 4), rb3_s[1][:, :c13].detach()) + 
-					   F.mse_loss(F.avg_pool2d(rb2_s[1][:, :c23], 2), rb3_s[1][:, :c23].detach())) / 3 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3 * args.lambda_intra
+			# Skip stage 0 (the stem) to mimic original rb1, rb2, rb3 logic
+			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
+			
+			# 1. Intra-layer loss (Self-regularization for every stage)
+			for stage in distill_stages:
+				intra_loss += intra_fd(stage)
+			intra_loss = intra_loss / len(distill_stages)
+			
+			# 2. Inter-layer loss (Compare every shallow stage to every deeper stage)
+			for i in range(len(distill_stages)):
+				for j in range(i + 1, len(distill_stages)):
+					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
+					num_pairs += 1
+					
+			if num_pairs > 0:
+				inter_loss = inter_loss / num_pairs
+
+			kd_loss = (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
 			
 		elif args.kd_mode in ['tfd+']:
-			c12 = min(rb1_s[1].shape[1], rb2_s[1].shape[1])
-			c13 = min(rb1_s[1].shape[1], rb3_s[1].shape[1])
-			c23 = min(rb2_s[1].shape[1], rb3_s[1].shape[1])
+			inter_loss = 0.0
+			intra_loss = 0.0
+			num_pairs = 0
 			
+			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
+			
+			for stage in distill_stages:
+				intra_loss += intra_fd(stage)
+			intra_loss = intra_loss / len(distill_stages)
+			
+			for i in range(len(distill_stages)):
+				for j in range(i + 1, len(distill_stages)):
+					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
+					num_pairs += 1
+					
+			if num_pairs > 0:
+				inter_loss = inter_loss / num_pairs
+				
+			# Base KL Divergence Loss
 			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1), reduction='batchmean') * 4 * 4 * args.lambda_kd
-			kd_loss += (F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c12], 2), rb2_s[1][:, :c12].detach()) + 
-					    F.mse_loss(F.avg_pool2d(rb1_s[1][:, :c13], 4), rb3_s[1][:, :c13].detach()) + 
-					    F.mse_loss(F.avg_pool2d(rb2_s[1][:, :c23], 2), rb3_s[1][:, :c23].detach())) / 3 * args.lambda_inter
-			kd_loss += (intra_fd(rb1_s[1]) + intra_fd(rb2_s[1]) + intra_fd(rb3_s[1])) / 3 * args.lambda_intra
+			
+			# Add dynamic inter and intra losses
+			kd_loss += (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
 		elif args.kd_mode in ['fitnet', 'nst']:
 			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
 		elif args.kd_mode in ['at', 'sp']:
@@ -604,32 +676,40 @@ def test(test_loader, nets, criterions, epoch):
 
 
 def intra_fd(f_s):
-    sorted_s, indices_s = torch.sort(torch.nn.functional.normalize(f_s, p=2, dim=(2,3)).mean([0, 2, 3]), dim=0, descending=True)
-    f_s = torch.index_select(f_s, 1, indices_s)
-    loss = F.mse_loss(f_s[:, 0:f_s.shape[1]//2, :, :], f_s[:, f_s.shape[1]//2: f_s.shape[1], :, :])
-    return loss
+    """
+    Self-regularization loss. Splits feature map in half channel-wise.
+    Ensures halves are perfectly symmetrical even if channel depth is odd.
+    """
+    half_c = f_s.shape[1] // 2
+    
+    # If a layer is too shallow to split (e.g., 1 channel), skip self-regularization
+    if half_c == 0:
+        return torch.tensor(0.0).to(f_s.device)
+        
+    # Strictly bound the second half to half_c*2 to prevent uneven tensor sizes
+    f_s_1 = f_s[:, 0:half_c, :, :]
+    f_s_2 = f_s[:, half_c:half_c*2, :, :]
+    
+    return F.mse_loss(f_s_1, f_s_2)
 
 def inter_fd(f_s, f_t):
     """
-    Dynamically aligns both channel depth and spatial resolution 
-    between any two arbitrary feature maps before calculating MSE.
+    Dynamically aligns spatial resolution between any two arbitrary 
+    feature maps before calculating MSE. (Channel depth is now 
+    handled globally by 1x1 projection layers).
     """
-    # 1. Align Channels (C)
-    min_C = min(f_s.shape[1], f_t.shape[1])
-    f_s_sliced = f_s[:, :min_C, :, :]
-    f_t_sliced = f_t[:, :min_C, :, :]
+    s_H, t_H = f_s.shape[2], f_t.shape[2]
     
-    # 2. Align Spatial Dimensions (H, W)
-    s_H, t_H = f_s_sliced.shape[2], f_t_sliced.shape[2]
+    # Align Spatial Dimensions (H, W)
     if s_H > t_H:
-        f_s_aligned = F.adaptive_avg_pool2d(f_s_sliced, (t_H, t_H))
-        f_t_aligned = f_t_sliced
+        f_s_aligned = F.adaptive_avg_pool2d(f_s, (t_H, t_H))
+        f_t_aligned = f_t
     elif s_H < t_H:
-        f_s_aligned = f_s_sliced
-        f_t_aligned = F.adaptive_avg_pool2d(f_t_sliced, (s_H, s_H))
+        f_s_aligned = f_s
+        f_t_aligned = F.adaptive_avg_pool2d(f_t, (s_H, s_H))
     else:
-        f_s_aligned = f_s_sliced
-        f_t_aligned = f_t_sliced
+        f_s_aligned = f_s
+        f_t_aligned = f_t
         
     return F.mse_loss(f_s_aligned, f_t_aligned.detach())
 

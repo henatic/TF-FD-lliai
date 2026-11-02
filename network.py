@@ -7,6 +7,7 @@ import torch.nn.functional as F
 import torch.hub as hub
 from torchvision.models import vgg19
 from torchvision.models.feature_extraction import create_feature_extractor, get_graph_node_names
+from nas_supernet import EdgeSupernet
 
 def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github', return_nodes=None):
     if hub_repo is not None:
@@ -25,14 +26,18 @@ def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github',
         # AUTO-DISCOVERY: If no manual mapping is provided, figure it out dynamically
         if return_nodes is None:
             print("Auto-discovering distillation nodes...")
-            return_nodes = auto_discover_nodes(net)
+            return_nodes, stage_channels = auto_discover_nodes(net)
             print(f"Discovered mapping: {return_nodes}")
+        else:
+            stage_channels = None
             
-        # Wrap the model for distillation compatibility (6-tuple output)
-        net = HubModelWrapper(net, return_nodes)
+        # Wrap the model and initialize the 1x1 projectors
+        net = HubModelWrapper(net, return_nodes, stage_channels)
     else:
         # Fallback to local offline custom architectures
-        if name == 'vgg19':
+        if name == 'edge_supernet':
+            net = EdgeSupernet(num_classes=num_class)
+        elif name == 'vgg19':
             net = VGG_Supernet(num_classes=num_class)
         elif name == 'vgg19_slim':
             net = VGG_Slim(num_classes=num_class)
@@ -55,8 +60,9 @@ def define_tsnet(name, num_class, cuda=True, hub_repo=None, hub_source='github',
 
 def auto_discover_nodes(model, input_shape=(2, 3, 32, 32)):
     """
-    Passes a dummy tensor through the model to track feature map shapes
-    and automatically maps the stage boundaries for distillation.
+    Passes a dummy tensor through the model to track feature map shapes,
+    automatically maps the stage boundaries for distillation, and extracts
+    channel dimensions for 1x1 projection layers.
     """
     # Force eval mode to prevent BatchNorm variance crashes on small dummy batches
     model.eval()
@@ -97,49 +103,63 @@ def auto_discover_nodes(model, input_shape=(2, 3, 32, 32)):
                 if node_name != train_nodes[-1]: 
                     feat_node = node_name
 
-    # Fallback: if the network has fewer than 4 pooling stages, duplicate the deepest node
-    while len(stage_boundaries) < 4:
+    # Append the final spatial layer if it wasn't caught by a resolution drop
+    if last_4d_node not in stage_boundaries:
         stage_boundaries.append(last_4d_node)
 
     # Fallback: if no 2D flattening node is found, use the final 4D node
     if feat_node is None:
         feat_node = last_4d_node
 
-    distillation_nodes = {
-        stage_boundaries[0]: 'stem',
-        stage_boundaries[1]: 'rb1',
-        stage_boundaries[2]: 'rb2',
-        stage_boundaries[3]: 'rb3',
-        feat_node: 'feat',
-        train_nodes[-1]: 'out'
-    }
+    # Build a dynamic dictionary for ANY number of stages and extract channel depths
+    distillation_nodes = {}
+    stage_channels = []
+    
+    for i, node in enumerate(stage_boundaries):
+        distillation_nodes[node] = f'stage_{i}'
+        stage_channels.append(features[node].shape[1])
+        
+    distillation_nodes[feat_node] = 'feat'
+    distillation_nodes[train_nodes[-1]] = 'out'
     
     # Return the model to train mode before exiting
     model.train()
     
-    return distillation_nodes
+    return distillation_nodes, stage_channels
 
 class HubModelWrapper(nn.Module):
-    def __init__(self, base_model, return_nodes):
-        super(HubModelWrapper, self).__init__()
-        # return_nodes maps internal model nodes to our required output names
-        # e.g., {'layer1': 'rb1', 'layer2': 'rb2', 'layer3': 'rb3', 'flatten': 'feat', 'fc': 'out'}
+    def __init__(self, base_model, return_nodes, stage_channels=None):
+        super().__init__()
         self.feature_extractor = create_feature_extractor(base_model, return_nodes=return_nodes)
         
+        # Build 1x1 projection layers to unify channel depths and prevent slicing data loss
+        self.projectors = nn.ModuleList()
+        if stage_channels:
+            min_c = min(stage_channels)
+            for c in stage_channels:
+                self.projectors.append(nn.Conv2d(c, min_c, kernel_size=1, bias=False))
+
     def forward(self, x):
-        features = self.feature_extractor(x)
+        features_dict = self.feature_extractor(x)
         
-        # Extract features, defaulting to the input tensor if a node was mapped incorrectly
-        stem = features.get('stem', x)
-        rb1  = features.get('rb1', x)
-        rb2  = features.get('rb2', x)
-        rb3  = features.get('rb3', x)
-        feat = features.get('feat', x)
-        out  = features.get('out', x)
+        intermediate_features = []
+        feat = None
+        out = None
         
-        # train_kd.py expects the first four outputs to be tuples of (pre_act, post_act)
-        # Hub models only output post-activations, so we duplicate the tensor to satisfy the unpacker
-        return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
+        idx = 0
+        for alias, tensor in features_dict.items():
+            if alias == 'out':
+                out = tensor
+            elif alias == 'feat':
+                feat = tensor
+            else:
+                # Route the stage through its assigned 1x1 projection layer
+                if hasattr(self, 'projectors') and len(self.projectors) > idx:
+                    tensor = self.projectors[idx](tensor)
+                intermediate_features.append(tensor)
+                idx += 1
+                
+        return intermediate_features, feat, out
 
 class VGG19_KD(nn.Module):
     def __init__(self, num_classes=100):
@@ -419,20 +439,21 @@ class resnet20(nn.Module):
 		return nn.Sequential(*layers)
 
 	def forward(self, x):
-		pstem = self.conv1(x) # pstem: pre stem before activation
+		pstem = self.conv1(x) 
 		pstem = self.bn1(pstem)
 		stem  = self.relu(pstem)
-		stem  = (pstem, stem)
 
-		rb1 = self.res1(stem[1])
+		rb1 = self.res1(stem)
 		rb2 = self.res2(rb1[1])
 		rb3 = self.res3(rb2[1])
+
+		intermediate_features = [stem, rb1[1], rb2[1], rb3[1]]
 
 		feat = self.avgpool(rb3[1])
 		feat = feat.view(feat.size(0), -1)
 		out  = self.fc(feat)
 
-		return stem, rb1, rb2, rb3, feat, out
+		return intermediate_features, feat, out
 
 	def get_channel_num(self):
 		return [16, 16, 32, 64, 64, self.num_class]
@@ -478,20 +499,21 @@ class resnet110(nn.Module):
 		return nn.Sequential(*layers)
 
 	def forward(self, x):
-		pstem = self.conv1(x) # pstem: pre stem before activation
+		pstem = self.conv1(x)
 		pstem = self.bn1(pstem)
 		stem  = self.relu(pstem)
-		stem  = (pstem, stem)
 
-		rb1 = self.res1(stem[1])
+		rb1 = self.res1(stem)
 		rb2 = self.res2(rb1[1])
 		rb3 = self.res3(rb2[1])
+
+		intermediate_features = [stem, rb1[1], rb2[1], rb3[1]]
 
 		feat = self.avgpool(rb3[1])
 		feat = feat.view(feat.size(0), -1)
 		out  = self.fc(feat)
 
-		return stem, rb1, rb2, rb3, feat, out
+		return intermediate_features, feat, out
 
 	def get_channel_num(self):
 		return [16, 16, 32, 64, 64, self.num_class]
