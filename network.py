@@ -180,8 +180,8 @@ class VGG19_KD(nn.Module):
         )
 
     def forward(self, x):
-		# Manually chunk the sequential features into blocks matching ResNet's stages
-		# pool1=idx 4, pool2=idx 9, pool3=idx 18, pool4=idx 27, pool5=idx 36
+        # Manually chunk the sequential features into blocks matching ResNet's stages
+        # pool1=idx 4, pool2=idx 9, pool3=idx 18, pool4=idx 27, pool5=idx 36
         stem = self.features[:10](x)
         rb1 = self.features[10:19](stem)
         rb2 = self.features[19:28](rb1)
@@ -190,8 +190,10 @@ class VGG19_KD(nn.Module):
         feat = rb3.view(rb3.size(0), -1)
         out = self.classifier(feat)
 
-		# Emulate the (pre_activation, post_activation) tuple expected by train_kd.py
-        return (stem, stem), (rb1, rb1), (rb2, rb2), (rb3, rb3), feat, out
+        # Pack ONLY the active feature maps into the dynamic list
+        intermediate_features = [stem, rb1, rb2, rb3]
+
+        return intermediate_features, feat, out
 
     def get_channel_num(self):
 		# Match expected channel return signatures if using VID/AFD loss modes

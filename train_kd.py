@@ -10,6 +10,8 @@ import argparse
 import json
 import numpy as np
 import random
+import math
+import logging
 from itertools import chain
 
 import torch
@@ -386,161 +388,105 @@ def train_init(train_loader, nets, optimizer, criterions, total_epoch):
 		logging.info('Epoch time: {}s'.format(int(epoch_duration)))
 
 
-
-
-
 def train(train_loader, nets, optimizer, criterions, epoch):
-	batch_time = AverageMeter()
-	data_time  = AverageMeter()
-	cls_losses = AverageMeter()
-	kd_losses  = AverageMeter()
-	top1       = AverageMeter()
-	top5       = AverageMeter()
+    """
+    Executes one full training epoch for the NAS EdgeSupernet using Tf-FD.
+    """
+    snet, tnet = nets['snet'], nets['tnet']
+    
+    # 1. SUPERNET WARM-UP & CONTROLLER PHASE
+    # Dynamically find all NAS choices in the network
+    blocks = [m for m in snet.modules() if hasattr(m, 'active_choice')]
+    for block in blocks:
+        if epoch <= 30:
+            # WARM-UP: Lock to the heaviest block (Index 3: MBConv Expandx6)
+            # This establishes highly accurate baseline shared weights
+            block.active_choice = len(block.choices) - 1 
+        else:
+            # SEARCH: Unlock random sampling for the remaining epochs
+            block.active_choice = random.randint(0, len(block.choices) - 1)
 
-	snet = nets['snet']
-	tnet = nets['tnet']
+    # 2. SET MODES
+    snet.train()
+    if tnet is not None:
+        tnet.eval()
 
-	criterionCls = criterions['criterionCls']
-	criterionKD  = criterions['criterionKD']
+    # 3. INITIALIZE METERS
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    cls_losses = AverageMeter()
+    kd_losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
 
-	snet.train()
-	if args.kd_mode in ['vid', 'ofd']:
-		for i in range(1,4):
-			criterionKD[i].train()
+    end = time.time()
 
-	end = time.time()
-	for batch_idx, (img, target) in enumerate(train_loader):
-		img, target = img.cuda(), target.cuda()
-		
-		# --- NAS CONTROLLER: Sample a random sub-network for this batch ---
-		if isinstance(snet, EdgeSupernet) or hasattr(snet, 'module') and isinstance(snet.module, EdgeSupernet):
-			base_net = snet.module if hasattr(snet, 'module') else snet
-			for name, module in base_net.named_modules():
-				if isinstance(module, NASChoiceBlock):
-					# Randomly pick an architecture choice (0 to len(choices)-1)
-					module.active_choice = random.randint(0, len(module.choices) - 1)
-		# ------------------------------------------------------------------
+    # 4. BATCH ITERATION
+    for i, (img, target) in enumerate(train_loader):
+        data_time.update(time.time() - end)
+        img, target = img.cuda(), target.cuda()
 
-		optimizer.zero_grad()
-		
-		# The Supernet natively returns the dynamic list your tfd loss expects
-		stages_s, feat_s, out_s = snet(img)
-		stages_t, feat_t, out_t = tnet(img)
+        # --- FORWARD PASS ---
+        # Dynamic 3-tuple unpacking supports any network depth
+        stages_s, feat_s, out_s = snet(img)
+        
+        if tnet is not None:
+            with torch.no_grad():
+                stages_t, feat_t, out_t = tnet(img)
+        else:
+            stages_t, feat_t, out_t = None, None, None
 
-		cls_loss = criterionCls(out_s, target)
-		if args.kd_mode in ['logits', 'st']:
-			kd_loss = criterionKD(out_s, out_t.detach()) * args.lambda_kd
-		elif args.kd_mode in ['tfd']:
-			inter_loss = 0.0
-			intra_loss = 0.0
-			num_pairs = 0
-			
-			# Skip stage 0 (the stem) to mimic original rb1, rb2, rb3 logic
-			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
-			
-			# 1. Intra-layer loss (Self-regularization for every stage)
-			for stage in distill_stages:
-				intra_loss += intra_fd(stage)
-			intra_loss = intra_loss / len(distill_stages)
-			
-			# 2. Inter-layer loss (Compare every shallow stage to every deeper stage)
-			for i in range(len(distill_stages)):
-				for j in range(i + 1, len(distill_stages)):
-					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
-					num_pairs += 1
-					
-			if num_pairs > 0:
-				inter_loss = inter_loss / num_pairs
+        # --- LOSS CALCULATIONS ---
+        # Base classification loss
+        cls_loss = criterions['criterionCls'](out_s, target)
+        
+        kd_loss = 0.0
+        # Dynamic Teacher-Free Distillation (Tf-FD)
+        if tnet is not None and args.kd_mode == 'tfd':
+            inter_loss = 0.0
+            intra_loss = 0.0
+            
+            # Inter-Layer Alignment (Student vs Teacher)
+            for s_feat in stages_s:
+                for t_feat in stages_t:
+                    inter_loss += inter_fd(s_feat, t_feat)
+                    
+            # Intra-Layer Self-Regularization (Student vs Student)
+            for s_feat in stages_s:
+                intra_loss += intra_fd(s_feat)
+                
+            # Apply warm-up factor and lambdas
+            warm_up = args.kd_warm_up if hasattr(args, 'kd_warm_up') else (epoch / 20.0)
+            kd_loss = warm_up * (args.lambda_inter * inter_loss + args.lambda_intra * intra_loss)
 
-			kd_loss = (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
-			
-		elif args.kd_mode in ['tfd+']:
-			inter_loss = 0.0
-			intra_loss = 0.0
-			num_pairs = 0
-			
-			distill_stages = stages_s[1:] if len(stages_s) > 2 else stages_s
-			
-			for stage in distill_stages:
-				intra_loss += intra_fd(stage)
-			intra_loss = intra_loss / len(distill_stages)
-			
-			for i in range(len(distill_stages)):
-				for j in range(i + 1, len(distill_stages)):
-					inter_loss += inter_fd(distill_stages[i], distill_stages[j])
-					num_pairs += 1
-					
-			if num_pairs > 0:
-				inter_loss = inter_loss / num_pairs
-				
-			# Base KL Divergence Loss
-			kd_loss = F.kl_div(F.log_softmax(out_s/4, dim=1), F.softmax(out_t.detach()/4, dim=1), reduction='batchmean') * 4 * 4 * args.lambda_kd
-			
-			# Add dynamic inter and intra losses
-			kd_loss += (inter_loss * args.lambda_inter) + (intra_loss * args.lambda_intra)
-		elif args.kd_mode in ['fitnet', 'nst']:
-			kd_loss = criterionKD(rb3_s[1], rb3_t[1].detach()) * args.lambda_kd
-		elif args.kd_mode in ['at', 'sp']:
-			kd_loss = (criterionKD(rb1_s[1], rb1_t[1].detach()) +
-					   criterionKD(rb2_s[1], rb2_t[1].detach()) +
-					   criterionKD(rb3_s[1], rb3_t[1].detach())) / 3.0 * args.lambda_kd
-		elif args.kd_mode in ['pkt', 'rkd', 'cc']:
-			kd_loss = criterionKD(feat_s, feat_t.detach()) * args.lambda_kd
-		elif args.kd_mode in ['fsp']:
-			kd_loss = (criterionKD(stem_s[1], rb1_s[1], stem_t[1].detach(), rb1_t[1].detach()) +
-					   criterionKD(rb1_s[1],  rb2_s[1], rb1_t[1].detach(),  rb2_t[1].detach()) +
-					   criterionKD(rb2_s[1],  rb3_s[1], rb2_t[1].detach(),  rb3_t[1].detach())) / 3.0 * args.lambda_kd
-		elif args.kd_mode in ['ab']:
-			kd_loss = (criterionKD(rb1_s[0], rb1_t[0].detach()) +
-					   criterionKD(rb2_s[0], rb2_t[0].detach()) +
-					   criterionKD(rb3_s[0], rb3_t[0].detach())) / 3.0 * args.lambda_kd
-		elif args.kd_mode in ['sobolev']:
-			kd_loss = criterionKD(out_s, out_t, img, target) * args.lambda_kd
-		elif args.kd_mode in ['lwm']:
-			kd_loss = criterionKD(out_s, rb2_s[1], out_t, rb2_t[1], target) * args.lambda_kd
-		elif args.kd_mode in ['irg']:
-			kd_loss = criterionKD([rb2_s[1], rb3_s[1], feat_s, out_s],
-								  [rb2_t[1].detach(),
-								   rb3_t[1].detach(),
-								   feat_t.detach(),
-								   out_t.detach()]) * args.lambda_kd
-		elif args.kd_mode in ['vid', 'afd']:
-			kd_loss = (criterionKD[1](rb1_s[1], rb1_t[1].detach()) +
-					   criterionKD[2](rb2_s[1], rb2_t[1].detach()) +
-					   criterionKD[3](rb3_s[1], rb3_t[1].detach())) / 3.0 * args.lambda_kd
-		elif args.kd_mode in ['ofd']:
-			kd_loss = (criterionKD[1](rb1_s[0], rb1_t[0].detach()) +
-					   criterionKD[2](rb2_s[0], rb2_t[0].detach()) +
-					   criterionKD[3](rb3_s[0], rb3_t[0].detach())) / 3.0 * args.lambda_kd
-		else:
-			raise Exception('Invalid kd mode...')
-		loss = cls_loss + min(1, epoch/args.kd_warm_up) * kd_loss
+        loss = cls_loss + kd_loss
 
-		prec1, prec5 = accuracy(out_s, target, topk=(1,5))
-		cls_losses.update(cls_loss.item(), img.size(0))
-		kd_losses.update(kd_loss.item(), img.size(0))
-		top1.update(prec1.item(), img.size(0))
-		top5.update(prec5.item(), img.size(0))
+        # --- BACKWARD PASS ---
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-		optimizer.zero_grad()
-		loss.backward()
-		optimizer.step()
+        # --- UPDATE METERS ---
+        prec1, prec5 = accuracy(out_s, target, topk=(1, 5))
+        cls_losses.update(cls_loss.item(), img.size(0))
+        
+        if isinstance(kd_loss, torch.Tensor):
+            kd_losses.update(kd_loss.item(), img.size(0))
+            
+        top1.update(prec1.item(), img.size(0))
+        top5.update(prec5.item(), img.size(0))
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-		batch_time.update(time.time() - end)
-		end = time.time()
-
-		if i % args.print_freq == 0:
-			log_str = ('Epoch[{0}]:[{1:03}/{2:03}] '
-					   'Time:{batch_time.val:.4f} '
-					   'Data:{data_time.val:.4f}  '
-					   'Cls:{cls_losses.val:.4f}({cls_losses.avg:.4f})  '
-					   'KD:{kd_losses.val:.4f}({kd_losses.avg:.4f})  '
-					   'prec@1:{top1.val:.2f}({top1.avg:.2f})  '
-					   'prec@5:{top5.val:.2f}({top5.avg:.2f})'.format(
-					   epoch, i, len(train_loader), batch_time=batch_time, data_time=data_time,
-					   cls_losses=cls_losses, kd_losses=kd_losses, top1=top1, top5=top5))
-			logging.info(log_str)
-
+        # --- LOGGING ---
+        if i % args.print_freq == 0:
+            print(f'Epoch: [{epoch}][{i}/{len(train_loader)}]\t'
+                  f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  f'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  f'Cls {cls_losses.val:.4f} ({cls_losses.avg:.4f})\t'
+                  f'KD {kd_losses.val:.4f} ({kd_losses.avg:.4f})\t'
+                  f'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                  f'Prec@5 {top5.val:.3f} ({top5.avg:.3f})')
 
 def test(test_loader, nets, criterions, epoch):
 	cls_losses = AverageMeter()
@@ -694,22 +640,22 @@ def intra_fd(f_s):
 
 def inter_fd(f_s, f_t):
     """
-    Dynamically aligns spatial resolution between any two arbitrary 
-    feature maps before calculating MSE. (Channel depth is now 
-    handled globally by 1x1 projection layers).
+    Dynamically aligns spatial resolution and channel depth between 
+    any two arbitrary feature maps before calculating MSE.
     """
-    s_H, t_H = f_s.shape[2], f_t.shape[2]
+    s_C, s_H = f_s.shape[1], f_s.shape[2]
+    t_C, t_H = f_t.shape[1], f_t.shape[2]
     
-    # Align Spatial Dimensions (H, W)
+    # 1. Align Channel Depth (Fallback for native models bypassing 1x1 wrappers)
+    min_C = min(s_C, t_C)
+    f_s_aligned = f_s[:, :min_C, :, :]
+    f_t_aligned = f_t[:, :min_C, :, :]
+    
+    # 2. Align Spatial Dimensions (H, W)
     if s_H > t_H:
-        f_s_aligned = F.adaptive_avg_pool2d(f_s, (t_H, t_H))
-        f_t_aligned = f_t
+        f_s_aligned = F.adaptive_avg_pool2d(f_s_aligned, (t_H, t_H))
     elif s_H < t_H:
-        f_s_aligned = f_s
-        f_t_aligned = F.adaptive_avg_pool2d(f_t, (s_H, s_H))
-    else:
-        f_s_aligned = f_s
-        f_t_aligned = f_t
+        f_t_aligned = F.adaptive_avg_pool2d(f_t_aligned, (s_H, s_H))
         
     return F.mse_loss(f_s_aligned, f_t_aligned.detach())
 
@@ -724,17 +670,20 @@ def adjust_lr_init(optimizer, epoch):
 	for param_group in optimizer.param_groups:
 		param_group['lr'] = lr
 
-
 def adjust_lr(optimizer, epoch):
-	scale   = 0.1
-	lr_list =  [args.lr] * 150
-	lr_list += [args.lr*scale] * 30
-	lr_list += [args.lr*scale*scale] * 30
-	lr_list += [args.lr*scale*scale*scale] * 30
-	lr = lr_list[epoch-1]
-	logging.info('Epoch: {}  lr: {:.3f}'.format(epoch, lr))
-	for param_group in optimizer.param_groups:
-		param_group['lr'] = lr
+    """Smoothly decays the learning rate to 0 using a cosine curve."""
+    # Assuming args.epochs is available globally in the script
+    total_epochs = args.epochs 
+    
+    # Cosine annealing math
+    lr = 0.5 * args.lr * (1 + math.cos(math.pi * (epoch - 1) / total_epochs))
+    
+    # Prevent learning rate from hitting absolute zero too early
+    lr = max(lr, 1e-5)
+    
+    logging.info('Epoch: {}  lr: {:.5f}'.format(epoch, lr))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
 
 
 if __name__ == '__main__':

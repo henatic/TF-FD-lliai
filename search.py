@@ -1,157 +1,157 @@
-import os
-import json
-import random
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import torchvision.datasets as dst
+import random
+import argparse
+from tqdm import tqdm
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, random_split
+import torchvision.datasets as dst
+from utils import AverageMeter, accuracy, count_parameters_in_MB
+from nas_supernet import EdgeSupernet, NASChoiceBlock
 
-# Import your custom modules
-from network import define_tsnet, initialize_vgg19_supernet
-from controller import NASController
-from reward import calculate_vgg_cost, compute_reward
+class EvolutionarySearch:
+    def __init__(self, supernet, val_loader, pop_size=50, max_epochs=20, max_param_mb=1.5):
+        self.supernet = supernet
+        self.val_loader = val_loader
+        self.pop_size = pop_size
+        self.max_epochs = max_epochs
+        self.max_param_mb = max_param_mb # Strict edge-device hardware constraint
+        
+        # Discover the search space dimensions dynamically
+        self.blocks = [m for m in supernet.modules() if isinstance(m, NASChoiceBlock)]
+        self.num_blocks = len(self.blocks)
+        self.num_choices = len(self.blocks[0].choices)
+        
+    def decode_genome(self, genome):
+        """Applies a genome (e.g., [0, 3, 2, 1, 3, 2]) to the Supernet blocks."""
+        for block, choice in zip(self.blocks, genome):
+            block.active_choice = choice
 
-VGG19_MAX_CONFIG = [64, 64, 128, 128, 256, 256, 256, 256,
-                    512, 512, 512, 512, 512, 512, 512, 512]
+    def evaluate_fitness(self, genome):
+        """Calculates Top-1 Accuracy, returning 0.0 if the hardware budget is exceeded."""
+        self.decode_genome(genome)
+        
+        # USE THE NEW ACTIVE PARAMETER COUNTER
+        param_mb = self.count_active_params()
+        if param_mb > self.max_param_mb:
+            return 0.0, param_mb
+            
+        self.supernet.eval()
+        top1 = AverageMeter()
+        
+        with torch.no_grad():
+            for img, target in self.val_loader:
+                img, target = img.cuda(), target.cuda()
+                
+                _, _, out = self.supernet(img)
+                prec1, _ = accuracy(out, target, topk=(1, 5))
+                top1.update(prec1.item(), img.size(0))
+                
+        return top1.avg, param_mb
 
-def get_nas_dataloaders(img_root='./datasets', batch_size=128):
-    mean = (0.5071, 0.4865, 0.4409)
-    std  = (0.2673, 0.2564, 0.2762)
+    def crossover(self, parent1, parent2):
+        """Randomly mixes genes from two high-performing parents."""
+        child = []
+        for g1, g2 in zip(parent1, parent2):
+            child.append(g1 if random.random() > 0.5 else g2)
+        return child
 
-    train_transform = transforms.Compose([
-        transforms.Pad(4, padding_mode='reflect'),
-        transforms.RandomCrop(32),
-        transforms.RandomHorizontalFlip(),
+    def mutate(self, genome, mutation_rate=0.1):
+        """Randomly alters individual genes to prevent local minima."""
+        mutated = []
+        for gene in genome:
+            if random.random() < mutation_rate:
+                mutated.append(random.randint(0, self.num_choices - 1))
+            else:
+                mutated.append(gene)
+        return mutated
+
+    def search(self):
+        # 1. Initialize random population
+        population = [[random.randint(0, self.num_choices - 1) for _ in range(self.num_blocks)] 
+                      for _ in range(self.pop_size)]
+        
+        for epoch in range(self.max_epochs):
+            print(f"\n--- Evolutionary Search Epoch {epoch+1}/{self.max_epochs} ---")
+            
+            # 2. Evaluate Fitness
+            fitness_scores = []
+            for genome in tqdm(population, desc="Evaluating Population"):
+                acc, params = self.evaluate_fitness(genome)
+                fitness_scores.append({'genome': genome, 'acc': acc, 'params': params})
+                
+            # Sort by accuracy (descending)
+            fitness_scores.sort(key=lambda x: x['acc'], reverse=True)
+            
+            best_genome = fitness_scores[0]
+            print(f"Best this epoch: Acc {best_genome['acc']:.2f}% | Params {best_genome['params']:.2f}MB | Genome {best_genome['genome']}")
+            
+            # 3. Elitism (Keep top 20% untouched)
+            retain_length = int(self.pop_size * 0.2)
+            parents = [x['genome'] for x in fitness_scores[:retain_length]]
+            
+            # 4. Breed next generation
+            next_generation = parents.copy()
+            while len(next_generation) < self.pop_size:
+                p1 = random.choice(parents)
+                p2 = random.choice(parents)
+                child = self.crossover(p1, p2)
+                child = self.mutate(child)
+                next_generation.append(child)
+                
+            population = next_generation
+            
+        print("\n--- Search Complete ---")
+        print(f"Optimal Sub-Network Genome: {fitness_scores[0]['genome']}")
+        return fitness_scores[0]['genome']
+
+    def count_active_params(self):
+        """Counts parameters only for the active sub-network routing."""
+        total_params = 0
+        
+        # 1. Count fixed components (stem and classifier)
+        for param in self.supernet.stem.parameters():
+            total_params += param.numel()
+        for param in self.supernet.classifier.parameters():
+            total_params += param.numel()
+            
+        # 2. Count ONLY the currently active choice in each NAS block
+        for block in self.blocks:
+            if block.active_choice != -1:
+                active_module = block.choices[block.active_choice]
+                for param in active_module.parameters():
+                    total_params += param.numel()
+                    
+        return total_params / 1e6
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Evolutionary Search for EdgeSupernet')
+    parser.add_argument('--supernet_path', type=str, required=True, help='Path to trained Supernet weights')
+    parser.add_argument('--img_root', type=str, default='./datasets', help='Path to CIFAR-100')
+    parser.add_argument('--max_params', type=float, default=1.5, help='Hardware budget in MB')
+    args = parser.parse_args()
+
+    # Load Dataset
+    mean, std = (0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)
+    val_transform = transforms.Compose([
+        transforms.CenterCrop(32),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std)
     ])
+    val_loader = torch.utils.data.DataLoader(
+        dst.CIFAR100(root=args.img_root, transform=val_transform, train=False, download=True),
+        batch_size=256, shuffle=False, num_workers=4, pin_memory=True
+    )
 
-    full_train_dataset = dst.CIFAR100(root=img_root, train=True, download=True, transform=train_transform)
+   # Initialize and Load Supernet
+    supernet = EdgeSupernet(num_classes=100).cuda()
+    checkpoint = torch.load(args.supernet_path)
     
-    # Partition 40k for supernet weights, 10k for controller policy
-    generator = torch.Generator().manual_seed(42)
-    supernet_data, controller_data = random_split(full_train_dataset, [40000, 10000], generator=generator)
-
-    supernet_loader = DataLoader(supernet_data, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    controller_loader = DataLoader(controller_data, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-
-    return supernet_loader, controller_loader
-
-
-def train_supernet(supernet, loader, optimizer, criterion, channel_choices, device):
-    supernet.train()
-    total_loss = 0.0
+    # Strip the 'module.' prefix added by DataParallel during training
+    state_dict = checkpoint['snet']
+    clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     
-    for img, target in loader:
-        img, target = img.to(device), target.to(device)
-        
-        # Fair sampling: pick a random architecture for this batch to train all weights evenly
-        random_config = [min(random.choice(channel_choices), VGG19_MAX_CONFIG[layer])
-                 for layer in range(16)]
-        
-        optimizer.zero_grad()
-        # VGG_Supernet returns (stem, rb1, rb2, rb3, feat, out)
-        _, _, _, _, _, logits = supernet(img, channel_config=random_config)
-        
-        loss = criterion(logits, target)
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-        
-    return total_loss / len(loader)
-
-
-def train_controller(controller, supernet, loader, optimizer, criterion, channel_choices, target_flops, device):
-    controller.train()
-    supernet.eval() # Freeze supernet weights during controller update
-    total_reward = 0.0
+    # Load the cleaned dictionary
+    supernet.load_state_dict(clean_state_dict)
     
-    for img, target in loader:
-        img, target = img.to(device), target.to(device)
-        optimizer.zero_grad()
-        
-        # 1. Controller samples an architecture
-        action_indices, log_prob = controller()
-        channel_config = [min(channel_choices[idx], VGG19_MAX_CONFIG[layer])
-                  for layer, idx in enumerate(action_indices)]
-        
-        # 2. Evaluate hardware cost
-        sampled_flops, _ = calculate_vgg_cost(channel_config, num_classes=100)
-        
-        # 3. Evaluate accuracy on validation batch (zero-shot)
-        with torch.no_grad():
-            _, _, _, _, _, logits = supernet(img, channel_config=channel_config)
-            val_loss = criterion(logits, target).item()
-            
-        # 4. Compute reward and apply REINFORCE
-        reward = compute_reward(val_loss, sampled_flops, target_flops, lambda_penalty=2.0)
-        policy_loss = -log_prob * reward
-        
-        policy_loss.backward()
-        optimizer.step()
-        
-        total_reward += reward
-        
-    return total_reward / len(loader), channel_config
-
-
-def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    channel_choices = [32, 64, 128, 256, 512]
-    
-    # Calculate baseline FLOPs dynamically
-    max_config = VGG19_MAX_CONFIG
-    vgg_baseline_flops, _ = calculate_vgg_cost(max_config, num_classes=100)
-    
-    # Set the target to 10% of the full VGG19 compute cost
-    target_flops = vgg_baseline_flops * 0.10
-    
-    print(f"VGG19 Baseline FLOPs: {vgg_baseline_flops / 1e6:.1f}M")
-    print(f"Search Target FLOPs: {target_flops / 1e6:.1f}M")
-    
-    print("Initializing NAS Pipeline...")
-    supernet_loader, controller_loader = get_nas_dataloaders()
-    
-    supernet = define_tsnet('vgg19', num_class=100, cuda=torch.cuda.is_available())
-    initialize_vgg19_supernet(supernet)
-    supernet_optimizer = optim.SGD(supernet.parameters(), lr=0.025, momentum=0.9, weight_decay=3e-4)
-    
-    controller = NASController(num_layers=16, num_choices=len(channel_choices)).to(device)
-    controller_optimizer = optim.Adam(controller.parameters(), lr=0.003)
-    
-    criterion = nn.CrossEntropyLoss().to(device)
-    
-    # Setup CSV Logging
-    log_file = "nas_search_log.csv"
-    with open(log_file, "w") as f:
-        f.write("Epoch,Supernet_Loss,Controller_Reward,Sampled_Config\n")
-    
-    epochs = 100
-    for epoch in range(epochs):
-        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
-        
-        # Phase 1: Train Supernet Weights
-        sup_loss = train_supernet(supernet, supernet_loader, supernet_optimizer, criterion, channel_choices, device)
-        print(f"Supernet Loss: {sup_loss:.4f}")
-        
-        # Phase 2: Train Controller Policy
-        avg_reward, last_config = train_controller(
-            controller, supernet, controller_loader, controller_optimizer, 
-            criterion, channel_choices, target_flops, device
-        )
-        print(f"Controller Reward: {avg_reward:.4f} | Latest Sample: {last_config}")
-        
-        # Append metrics to log file
-        with open(log_file, "a") as f:
-            # Wrap the config list in quotes so it occupies a single CSV column
-            config_str = f'"{str(last_config)}"'
-            f.write(f"{epoch+1},{sup_loss:.4f},{avg_reward:.4f},{config_str}\n")
-
-        with open("nas_vgg19_config.json", "w") as f:
-            json.dump(last_config, f)
-
-if __name__ == '__main__':
-    main()
+    # Run Search
+    searcher = EvolutionarySearch(supernet, val_loader, pop_size=40, max_epochs=15, max_param_mb=args.max_params)
+    optimal_genome = searcher.search()
